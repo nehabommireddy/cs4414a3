@@ -1,7 +1,7 @@
 use std::env;
 use std::io::{self, Write, BufRead, Result};
 use std::path::Path;
-use std::process::{Child, ChildStdout, Command};
+use std::process::{Child, ChildStdout, Command, Stdio};
 
 use minishell::{as_builtin, parse_pipeline, Builtin, Pipeline};
 
@@ -72,7 +72,28 @@ fn repl<T: LineReader>(is_interactive: bool, mut cmd_stream: T) {
             match as_builtin(&stage.program) {
                 Some(Builtin::Exit) => return,
                 Some(Builtin::Cd) => {
-                    todo!("Change the shell's cwd here (cd) ");
+                    let target = match stage.args.as_slice() {
+                    [] => match env::var("HOME")
+                        .or_else(|_| env::var("USERPROFILE"))
+                    {
+                        Ok(home) => home,
+                        Err(_) => {
+                            eprintln!("cd: home directory not found");
+                            continue;
+                        }
+                    },
+                    [dir] => dir.clone(),
+                    _ => {
+                        eprintln!("cd: usage: cd [directory]");
+                        continue;
+                    }
+                };
+
+                if let Err(e) = env::set_current_dir(&target) {
+                    eprintln!("cd: {target}: {e}");
+                }
+
+                continue;
                 }
                 Some(Builtin::Pwd) => {
                     match env::current_dir() {
@@ -82,7 +103,14 @@ fn repl<T: LineReader>(is_interactive: bool, mut cmd_stream: T) {
                     continue;
                 }
                 Some(Builtin::Source) => {
-                    todo!("Read and execute commands from file here (source)");
+                    match stage.args.as_slice() {
+                        [file] => match std::fs::File::open(file) {
+                            Ok(f) => repl(false, io::BufReader::new(f)),
+                            Err(e) => eprintln!("source: {file}: {e}"),
+                        },
+                        _ => eprintln!("source: usage: source <file>"),
+                    }
+                    continue;
                 }
                 None => {} // Not a built-in: fall through to external execution.
             }
@@ -106,7 +134,34 @@ fn run_pipeline(pipeline: &Pipeline) -> io::Result<i32> {
 
         let mut cmd = Command::new(&stage.program);
         cmd.args(&stage.args);
+        match prev_stdout.take() {
+            Some(out) => cmd.stdin(Stdio::from(out)),
+            None => cmd.stdin(Stdio::inherit()),
+        };
 
+        if is_last {
+            cmd.stdout(Stdio::inherit());
+        } else {
+            cmd.stdout(Stdio::piped());
+        }
+
+        // 3: spawn and track
+        match cmd.spawn() {
+            Ok(mut child) => {
+                prev_stdout = child.stdout.take();
+                children.push(child);
+            }
+            Err(e) => {
+                for child in &mut children {
+                    let _ = child.wait();
+                }
+
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("{}: {e}", stage.program),
+                ));
+            }
+        }
         // Recommended strategy
         // 1: decide this stage's stdin, then call cmd.stdin(...)
         // - step 4: does it come from the previous stage or the
@@ -123,13 +178,17 @@ fn run_pipeline(pipeline: &Pipeline) -> io::Result<i32> {
         // - on success: hand this stage's output to the next stage,
         //   and remember the child
         // - on failure: what should happen to the rest of the pipeline?
-
-        // This line only exists so the starter compiles - delete it once 1-3 are done.
-        let _ = (is_last, &mut cmd, &mut prev_stdout, &mut children);
-        todo!("Step 3: spawn + track child; step 4: wire pipes; step 5: apply redirection");
     }
     // Step 3: wait for every child to finish. Return the exit code of the last child.
-    todo!("Step 3: wait for all children and return the final stage's exit code");
+    let mut last_code = 0;
+    let n = children.len();
+    for (i, child) in children.iter_mut().enumerate() {
+        let status = child.wait()?;
+        if i == n - 1 {
+            last_code = status.code().unwrap_or(0);
+        }
+    }
+    Ok(last_code)
 }
 
 fn main() {
